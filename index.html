@@ -32,7 +32,7 @@
 <div class="modal-overlay hidden" id="settingsModal">
   <div class="modal">
     <h2>设置 / 剧本加载</h2>
-    <label>1. 选择剧本文件夹（内含 .txt 文件）</label>
+    <label>1. 选择剧本文件夹（内含 .json 文件）</label>
     <div class="row">
       <button id="chooseFolderBtn">选择文件夹</button>
       <select id="scriptFileSelect" class="hidden"></select>
@@ -104,7 +104,8 @@
   let autoQueue = [];
   let pendingAsk = null;
   let totalTokens = 0;
-  let memoryCounter = 0;
+  let totalCacheHitTokens = 0;
+  let totalCacheMissTokens = 0;
 
   let settings = {
     baseUrl: localStorage.getItem('baseUrl') || 'https://api.deepseek.com',
@@ -163,74 +164,26 @@
   }
 
   function parseScript(content) {
-    const errors = [];
-    const s = content.replace(/\r\n/g, '\n');
-    const hasMarker = marker => s.includes(marker);
-    const extractBlock = (startMarker, endMarker) => {
-      const idx = s.indexOf(startMarker);
-      if (idx === -1) return null;
-      const after = s.slice(idx + startMarker.length);
-      const endIdx = endMarker ? after.indexOf(endMarker) : after.length;
-      return endIdx === -1 ? after.trim() : after.slice(0, endIdx).trim();
-    };
-    const extractValue = (block, key) => {
-      const re = new RegExp(`^${key}\\s*[:：]\\s*(.+)$`, 'im');
-      const m = block.match(re);
-      return m ? m[1].trim() : null;
-    };
-    const requiredMarkers = ['【剧本名称】', '【剧本简介】', '【搜证轮数】', '【旁白】', '【角色】', '【证据】', '【结局】', '【凶手】'];
-    for (const m of requiredMarkers) if (!hasMarker(m)) errors.push(`缺少必要标记：${m}`);
-    if (errors.length) throw new Error(`剧本解析失败，请检查剧本文件，建议让AI重写。\n错误详情：\n${errors.join('\n')}`);
-
-    const title = extractValue(s.split('【剧本简介】')[0], '剧本名称') || '未命名剧本';
-    const brief = extractValue(s, '剧本简介') || '';
-    const roundsText = extractValue(s, '搜证轮数');
-    if (!roundsText || isNaN(parseInt(roundsText))) throw new Error(`剧本解析失败：搜证轮数不是有效数字。`);
-    const rounds = parseInt(roundsText);
-    const narration = extractValue(s, '旁白') || '';
-    const murdererRaw = extractValue(s, '凶手') || '';
-    const murdererName = murdererRaw.split(/[:：]/)[0]?.trim() || murdererRaw.trim();
-
-    const rolesBlock = extractBlock('【角色】', '【证据】');
-    if (!rolesBlock) throw new Error(`剧本解析失败：未找到【角色】到【证据】之间的内容。`);
-    const roleChunks = rolesBlock.split(/===([^=]+)===/).filter(str => str.trim() !== '');
-    if (roleChunks.length < 2 || roleChunks.length % 2 !== 0) throw new Error(`剧本解析失败：角色区块格式不正确。`);
-    const roles = [];
-    for (let i = 0; i < roleChunks.length; i += 2) {
-      const roleTitle = roleChunks[i].trim();
-      const roleBody = roleChunks[i+1];
-      const name = extractValue(roleBody, '名字') || roleTitle;
-      const identity = extractValue(roleBody, '身份') || '';
-      const goal = extractValue(roleBody, '目标') || '';
-      const secret = extractValue(roleBody, '隐藏故事') || '';
-      const prompt = extractValue(roleBody, '初始提示词') || '';
-      if (!name || !identity || !goal || !secret || !prompt) throw new Error(`剧本解析失败：角色「${roleTitle}」缺少必要字段。`);
-      roles.push({ id: name, title: roleTitle, name, identity, goal, secret, prompt, isPlayer: false, longTermMemory: '' });
+    let data;
+    try {
+      data = JSON.parse(content);
+    } catch (e) {
+      throw new Error('剧本 JSON 解析失败：' + e.message);
     }
-    if (roles.length < 2) throw new Error(`剧本解析失败：至少需要2个角色。`);
-
-    const evidenceBlock = extractBlock('【证据】', '【结局】');
-    if (!evidenceBlock) throw new Error(`剧本解析失败：未找到【证据】部分。`);
-    const evidenceChunks = evidenceBlock.split(/===第(\d+)轮===/).filter(str => str.trim() !== '');
-    if (evidenceChunks.length < 2) throw new Error(`剧本解析失败：证据区块格式不正确。`);
-    const evidenceRounds = [];
-    for (let i = 0; i < evidenceChunks.length; i += 2) {
-      const roundNum = parseInt(evidenceChunks[i]);
-      const content = evidenceChunks[i+1]?.trim();
-      if (!roundNum || !content) throw new Error(`剧本解析失败：证据第${evidenceChunks[i]}轮内容为空。`);
-      const items = content.split(/\n+/).map(l => l.trim()).filter(l => l);
-      if (items.length === 0) throw new Error(`剧本解析失败：证据第${roundNum}轮没有任何证据。`);
-      evidenceRounds[roundNum-1] = items;
+    if (!data.title || !data.brief || !data.rounds || !data.narration || !Array.isArray(data.roles) || !Array.isArray(data.evidence) || !data.truth || !data.storyEnd || !data.murderer) {
+      throw new Error('剧本 JSON 缺少必要字段');
     }
-    if (evidenceRounds.length !== rounds) throw new Error(`剧本解析失败：搜证轮数与证据轮数不一致。`);
-
-    const endingBlock = extractBlock('【结局】', null);
-    if (!endingBlock) throw new Error(`剧本解析失败：未找到【结局】部分。`);
-    const truth = extractValue(endingBlock, '真相') || '';
-    const storyEnd = extractValue(endingBlock, '结局故事') || '';
-    if (!truth || !storyEnd) throw new Error(`剧本解析失败：结局部分缺少必要字段。`);
-
-    return { title, brief, rounds, narration, roles, evidenceRounds, murderer: murdererName, truth, storyEnd };
+    if (data.roles.length < 2) throw new Error('剧本至少需要2个角色');
+    if (data.evidence.length !== data.rounds) throw new Error('搜证轮数与证据轮数不一致');
+    data.roles.forEach(r => {
+      if (!r.name || !r.identity || !r.goal || !r.secret || !r.prompt) {
+        throw new Error(`角色「${r.name || '未知'}」缺少必要字段`);
+      }
+      r.isPlayer = false;
+      r.longTermMemory = '';
+      r.memoryCounter = 0;
+    });
+    return data;
   }
 
   function autoRestoreTranscript() {
@@ -256,7 +209,7 @@
       scriptFiles = {};
       scriptFileSelect.innerHTML = '';
       for (const file of files) {
-        if (file.name.toLowerCase().endsWith('.txt')) {
+        if (file.name.toLowerCase().endsWith('.json')) {
           try {
             const text = await file.text();
             scriptFiles[file.name] = text;
@@ -268,7 +221,7 @@
         }
       }
       if (Object.keys(scriptFiles).length === 0) {
-        $('scriptInfo').textContent = '未找到 .txt 剧本文件';
+        $('scriptInfo').textContent = '未找到 .json 剧本文件';
         scriptFileSelect.classList.add('hidden');
         $('loadScriptBtn').classList.add('hidden');
       } else {
@@ -305,7 +258,7 @@
       const cb = document.createElement('input');
       cb.type = 'checkbox';
       cb.checked = false;
-      cb.dataset.roleId = role.id;
+      cb.dataset.roleName = role.name;
       cb.addEventListener('change', () => updateRolePlayStatus());
       label.appendChild(cb);
       label.appendChild(document.createTextNode(`${role.name}（${role.identity}）`));
@@ -316,7 +269,7 @@
     if (!parsedScript) return;
     const checkboxes = roleSelectList.querySelectorAll('input[type="checkbox"]');
     checkboxes.forEach(cb => {
-      const role = parsedScript.roles.find(r => r.id === cb.dataset.roleId);
+      const role = parsedScript.roles.find(r => r.name === cb.dataset.roleName);
       if (role) role.isPlayer = cb.checked;
     });
   }
@@ -389,7 +342,7 @@
 
     game = {
       script: parsedScript,
-      roles: parsedScript.roles.map(r => ({ ...r, isPlayer: r.isPlayer, longTermMemory: '' })),
+      roles: parsedScript.roles.map(r => ({ ...r, isPlayer: r.isPlayer })),
       stage: 'intro',
       round: 0,
       publicHistory: [],
@@ -397,7 +350,8 @@
       hasIntroduced: new Set(),
     };
     totalTokens = 0;
-    memoryCounter = 0;
+    totalCacheHitTokens = 0;
+    totalCacheMissTokens = 0;
     autoQueue = [];
     pendingAsk = null;
     settingsModal.classList.add('hidden');
@@ -430,8 +384,8 @@
       </div>`;
     });
     html += '<h3>公开证据</h3>';
-    if (game.round > 0 && game.script.evidenceRounds[game.round-1]) {
-      game.script.evidenceRounds[game.round-1].forEach(ev => { html += `<div class="evidence-item">- ${ev}</div>`; });
+    if (game.round > 0 && game.script.evidence[game.round-1]) {
+      game.script.evidence[game.round-1].forEach(ev => { html += `<div class="evidence-item">- ${ev}</div>`; });
     } else {
       html += '<div>尚未公开证据</div>';
     }
@@ -441,30 +395,33 @@
   async function processAutoQueue() {
     if (!game || game.currentSpeaker || pendingAsk) return;
     if (autoQueue.length === 0) return;
-    const roleId = autoQueue.shift();
-    await generateAiSpeech(roleId);
+    const roleName = autoQueue.shift();
+    await generateAiSpeech(roleName);
     if (autoQueue.length > 0 && !pendingAsk) processAutoQueue();
   }
 
-  async function fetchAiContent(roleId, messages) {
+  async function fetchAiContent(roleName, messages) {
     const res = await fetch(`${settings.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${settings.apiKey}` },
-      body: JSON.stringify({ model: settings.model, messages, temperature: 0.9, max_tokens: 200, stream: false }),
+      body: JSON.stringify({ model: settings.model, messages, temperature: 0.9, max_tokens: 500, stream: false }),
       signal: abortController.signal
     });
     if (!res.ok) throw new Error(`API错误 ${res.status}`);
     const data = await res.json();
-    return { content: (data.choices?.[0]?.message?.content || '').trim(), usage: data.usage || {} };
+    return {
+      content: (data.choices?.[0]?.message?.content || '').trim(),
+      usage: data.usage || {}
+    };
   }
 
-  async function updateMemory(roleId, content) {
+  async function updateMemory(roleName, content) {
     if (!game || !settings.apiKey || !settings.model) return;
-    const role = game.roles.find(r => r.id === roleId);
+    const role = game.roles.find(r => r.name === roleName);
     if (!role) return;
     const recentMessages = game.publicHistory.slice(-5).map(entry => {
       if (entry.speaker === 'system') return `系统：${entry.content}`;
-      const speakerName = game.roles.find(r => r.id === entry.speaker)?.name || entry.speaker;
+      const speakerName = game.roles.find(r => r.name === entry.speaker)?.name || entry.speaker;
       return `${speakerName}：${entry.content}`;
     }).join('\n');
     const systemPrompt = `你是剧本杀角色「${role.name}」。请更新你的长期记忆摘要，只输出摘要本身。\n旧摘要：${role.longTermMemory || '无'}\n\n最近对话：\n${recentMessages}\n\n新摘要要求：包含公开行动、你撒过的谎、对你不利的证据、你怀疑谁、谁怀疑你。`;
@@ -472,7 +429,7 @@
       const res = await fetch(`${settings.baseUrl}/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${settings.apiKey}` },
-        body: JSON.stringify({ model: settings.model, messages: [{ role: 'system', content: systemPrompt }], temperature: 0.3, max_tokens: 100, stream: false })
+        body: JSON.stringify({ model: settings.model, messages: [{ role: 'system', content: systemPrompt }], temperature: 0.3, max_tokens: 150, stream: false })
       });
       if (!res.ok) return;
       const data = await res.json();
@@ -482,26 +439,29 @@
     } catch (e) {}
   }
 
-  async function generateAiSpeech(roleId) {
-    const role = game.roles.find(r => r.id === roleId);
+  async function generateAiSpeech(roleName) {
+    const role = game.roles.find(r => r.name === roleName);
     if (!role) return;
     if (!settings.apiKey || !settings.model) { termError('缺少 API 设置'); return; }
-    const messages = buildAiMessages(roleId);
+    const messages = buildAiMessages(roleName);
     abortController = new AbortController();
-    game.currentSpeaker = roleId;
+    game.currentSpeaker = roleName;
     termPrint(`[系统] ${role.name} 正在输入...`, 'sys');
     let content = '';
     let usage = {};
     try {
-      const result = await fetchAiContent(roleId, messages);
+      const result = await fetchAiContent(roleName, messages);
       content = result.content;
       usage = result.usage;
       totalTokens += usage.total_tokens || 0;
+      totalCacheHitTokens += usage.prompt_cache_hit_tokens || 0;
+      totalCacheMissTokens += usage.prompt_cache_miss_tokens || 0;
       if (!content) content = '（沉默）';
       termPrint(`${role.name}：`, 'ai');
       await typewrite(content, 'ai', settings.typeSpeed).done;
-      recordSpeech(roleId, content);
-      termPrint(`（本次：${usage.total_tokens || 0} token，总token：${totalTokens}，总花费约¥${(totalTokens * COST_PER_TOKEN).toFixed(6)}）`, 'sys');
+      recordSpeech(roleName, content);
+      const cacheInfo = getCacheInfo(usage);
+      termPrint(`（本次：${usage.total_tokens || 0} token，总token：${totalTokens}，缓存命中率：${cacheInfo}，总花费约¥${(totalTokens * COST_PER_TOKEN).toFixed(6)}）`, 'sys');
 
       const mentionRegex = /@([^\s@]+)/g;
       const mentions = [];
@@ -511,8 +471,8 @@
         for (const name of mentions) {
           if (name === '所有人') continue;
           const targetRole = game.roles.find(r => r.name === name && !r.isPlayer);
-          if (targetRole && targetRole.id !== roleId) {
-            pendingAsk = { roleId, targetRoleId: targetRole.id };
+          if (targetRole && targetRole.name !== roleName) {
+            pendingAsk = { roleName, targetRoleName: targetRole.name };
             termPrint(`[系统] ${role.name} 想 @ ${targetRole.name}，允许发言吗？(0同意 1拒绝)`, 'prompt');
             focusInput();
             return;
@@ -520,56 +480,70 @@
         }
       }
     } catch (e) {
-      content = '（沉默）';
+      content = '……';
       termPrint(`${role.name}：`, 'ai');
       await typewrite(content, 'ai', settings.typeSpeed).done;
-      recordSpeech(roleId, content);
+      recordSpeech(roleName, content);
       termPrint(`（请求失败，总token：${totalTokens}，总花费约¥${(totalTokens * COST_PER_TOKEN).toFixed(6)}）`, 'sys');
     } finally {
       game.currentSpeaker = null;
       abortController = null;
-      if (content && content !== '（沉默）') {
-        memoryCounter++;
-        if (memoryCounter % 3 === 0) updateMemory(roleId, content);
+      if (content && content !== '（沉默）' && content !== '……') {
+        role.memoryCounter = (role.memoryCounter || 0) + 1;
+        if (role.memoryCounter >= 3) {
+          role.memoryCounter = 0;
+          updateMemory(roleName, content);
+        }
       }
       if (!pendingAsk && autoQueue.length > 0) processAutoQueue();
     }
   }
 
-  function buildAiMessages(roleId) {
-    const role = game.roles.find(r => r.id === roleId);
-    const otherRoles = game.roles.filter(r => r.id !== roleId).map(r => `${r.name}（${r.identity}）`).join('、');
-    let currentEvidence = '（暂无公开证据）';
-    if (game.round > 0 && game.script.evidenceRounds[game.round-1]) {
-      currentEvidence = game.script.evidenceRounds[game.round-1].join('；');
-    }
+  function getCacheInfo(usage) {
+    const hit = usage.prompt_cache_hit_tokens || 0;
+    const miss = usage.prompt_cache_miss_tokens || 0;
+    const totalPrompt = hit + miss;
+    if (totalPrompt === 0) return '无数据';
+    const rate = ((hit / totalPrompt) * 100).toFixed(1);
+    return `${rate}%`;
+  }
+
+  function buildAiMessages(roleName) {
+    const role = game.roles.find(r => r.name === roleName);
+    const otherRoles = game.roles.filter(r => r.name !== roleName).map(r => `${r.name}（${r.identity}）`).join('、');
+
     const fixedPrompt = `你是剧本杀游戏《${game.script.title}》中的角色「${role.name}」。\n` +
       `公开身份：${role.identity}\n` +
       `个人目标：${role.goal}\n` +
       `隐藏秘密：${role.secret}\n` +
       `初始提示词：${role.prompt}\n` +
-      `当前阶段：${game.stage}\n` +
       `公共背景：${game.script.brief}\n` +
       `其他角色：${otherRoles}\n` +
-      `当前证据：${currentEvidence}\n` +
-      `长期记忆：${role.longTermMemory || '无'}\n` +
       `规则：你是一个真人玩家，不要暴露自己是AI。可以推理、怀疑、辩解、撒谎，但不要主动承认自己是凶手。发言要简短自然，像日常对话，优先回应玩家最近的发言。`;
+
+    let currentEvidence = '（暂无公开证据）';
+    if (game.round > 0 && game.script.evidence[game.round-1]) {
+      currentEvidence = game.script.evidence[game.round-1].join('；');
+    }
 
     const recentEntries = game.publicHistory.slice(-5);
     const recentTranscript = recentEntries.map(entry => {
       if (entry.speaker === 'system') return `系统：${entry.content}`;
-      const speakerName = game.roles.find(r => r.id === entry.speaker)?.name || entry.speaker;
+      const speakerName = game.roles.find(r => r.name === entry.speaker)?.name || entry.speaker;
       return `${speakerName}：${entry.content}`;
     }).join('\n');
 
+    const lastPlayerEntry = [...game.publicHistory].reverse().find(entry => game.roles.find(r => r.name === entry.speaker)?.isPlayer);
+    const playerLast = lastPlayerEntry ? `${game.roles.find(r => r.name === lastPlayerEntry.speaker)?.name}：${lastPlayerEntry.content}` : '';
+
     return [
       { role: 'system', content: fixedPrompt },
-      { role: 'user', content: `最近对话：\n${recentTranscript}\n\n现在轮到你发言，请简短自然地发言。` }
+      { role: 'user', content: `当前阶段：${game.stage}\n当前证据：${currentEvidence}\n你的长期记忆：${role.longTermMemory || '无'}\n最近对话：\n${recentTranscript}\n玩家最近发言：${playerLast || '无'}\n\n现在轮到你发言，请简短自然地发言。` }
     ];
   }
 
-  function recordSpeech(roleId, content) {
-    game.publicHistory.push({ speaker: roleId, content });
+  function recordSpeech(roleName, content) {
+    game.publicHistory.push({ speaker: roleName, content });
   }
 
   function enterRound(roundNum) {
@@ -577,7 +551,7 @@
     game.round = roundNum;
     game.stage = 'investigation';
     termPrint(`\n=== 第 ${roundNum} 轮搜证开始 ===`, 'narrator');
-    const evidence = game.script.evidenceRounds[roundNum-1];
+    const evidence = game.script.evidence[roundNum-1];
     if (evidence) {
       termPrint(`【第${roundNum}轮证据公开】`, 'evidence');
       evidence.forEach(ev => termPrint(ev, 'evidence'));
@@ -603,13 +577,13 @@
 
     if (pendingAsk) {
       if (content === '0' || content === '1') {
-        const targetRoleId = pendingAsk.targetRoleId;
-        const targetRole = game.roles.find(r => r.id === targetRoleId);
-        const asker = game.roles.find(r => r.id === pendingAsk.roleId);
+        const targetRoleName = pendingAsk.targetRoleName;
+        const targetRole = game.roles.find(r => r.name === targetRoleName);
+        const asker = game.roles.find(r => r.name === pendingAsk.roleName);
         pendingAsk = null;
         if (content === '0') {
           termPrint(`[系统] 已同意 ${asker.name} 的 @，${targetRole.name} 将发言。`, 'sys');
-          autoQueue.unshift(targetRoleId);
+          autoQueue.unshift(targetRoleName);
         } else {
           termPrint(`[系统] 已拒绝 ${asker.name} 的 @。`, 'sys');
         }
@@ -631,11 +605,11 @@
       return;
     }
 
-    const roleId = game.currentRoleId || game.roles.filter(r => r.isPlayer)[0]?.id;
-    const role = game.roles.find(r => r.id === roleId);
+    const roleName = game.currentRoleName || game.roles.filter(r => r.isPlayer)[0]?.name;
+    const role = game.roles.find(r => r.name === roleName);
     if (!role) { termError('请先选择当前发言身份，使用 /role 名字'); return; }
     termPrint(`${role.name}：${content}`, 'player');
-    recordSpeech(roleId, content);
+    recordSpeech(roleName, content);
     updateSidebar();
 
     const mentionRegex = /@([^\s@]+)/g;
@@ -644,19 +618,19 @@
     while ((match = mentionRegex.exec(content)) !== null) mentions.push(match[1]);
 
     if (mentions.includes('所有人')) {
-      autoQueue = game.roles.filter(r => !r.isPlayer).map(r => r.id);
+      autoQueue = game.roles.filter(r => !r.isPlayer).map(r => r.name);
       processAutoQueue();
       return;
     }
 
     if (mentions.length > 0) {
-      const targetIds = [];
+      const targetNames = [];
       mentions.forEach(name => {
         if (name === '所有人') return;
         const mentionedRole = game.roles.find(r => r.name === name && !r.isPlayer);
-        if (mentionedRole && !targetIds.includes(mentionedRole.id)) targetIds.push(mentionedRole.id);
+        if (mentionedRole && !targetNames.includes(mentionedRole.name)) targetNames.push(mentionedRole.name);
       });
-      if (targetIds.length > 0) { autoQueue = targetIds; processAutoQueue(); }
+      if (targetNames.length > 0) { autoQueue = targetNames; processAutoQueue(); }
     }
   }
 
@@ -664,13 +638,34 @@
     const parts = cmd.trim().split(/\s+/);
     const main = parts[0].toLowerCase();
     switch (main) {
-      case '/help': termPrint('/help /role /endintro /search /vote /trigger /save /load /copy /tokens /status /settings', 'sys'); break;
+      case '/help': termPrint('/help /role /endintro /search /vote /trigger /copy /tokens /status /settings /brain', 'sys'); break;
+      case '/brain':
+        if (!game) { termError('游戏未开始。'); break; }
+        if (parts.length < 2) { termError('用法：/brain 角色名字'); break; }
+        const brainName = parts.slice(1).join(' ');
+        const brainRole = game.roles.find(r => r.name === brainName && !r.isPlayer);
+        if (!brainRole) { termError(`找不到该角色：${brainName}`); break; }
+        termPrint(`=== ${brainRole.name} 的大脑 ===`, 'info');
+        termPrint(`公开身份：${brainRole.identity}`, 'sys');
+        termPrint(`个人目标：${brainRole.goal}`, 'sys');
+        termPrint(`隐藏秘密：${brainRole.secret}`, 'sys');
+        termPrint(`初始提示词：${brainRole.prompt}`, 'sys');
+        termPrint(`长期记忆：${brainRole.longTermMemory || '无'}`, 'sys');
+        const currentEvidence = game.round > 0 && game.script.evidence[game.round-1] ? game.script.evidence[game.round-1].join('；') : '暂无';
+        termPrint(`当前证据：${currentEvidence}`, 'sys');
+        const recentTranscript = game.publicHistory.slice(-5).map(entry => {
+          if (entry.speaker === 'system') return `系统：${entry.content}`;
+          const speakerName = game.roles.find(r => r.name === entry.speaker)?.name || entry.speaker;
+          return `${speakerName}：${entry.content}`;
+        }).join('\n');
+        termPrint(`最近对话：\n${recentTranscript}`, 'sys');
+        break;
       case '/role':
         if (parts.length < 2) { termError('用法：/role 角色名字'); break; }
         const name = parts.slice(1).join(' ');
         const role = game.roles.find(r => r.isPlayer && r.name === name);
         if (!role) { termError(`找不到该玩家角色：${name}`); break; }
-        game.currentRoleId = role.id;
+        game.currentRoleName = role.name;
         termPrint(`[系统] 当前发言身份切换为 ${role.name}`, 'sys');
         updateSidebar();
         break;
@@ -688,27 +683,10 @@
         break;
       case '/trigger':
         if (!game) { termError('游戏未开始。'); break; }
-        const available = game.roles.filter(r => !r.isPlayer && !autoQueue.includes(r.id) && game.currentSpeaker !== r.id);
+        const available = game.roles.filter(r => !r.isPlayer && !autoQueue.includes(r.name) && game.currentSpeaker !== r.name);
         if (available.length === 0) { termPrint('暂无可请求发言的 AI。', 'sys'); break; }
-        autoQueue.push(available[Math.floor(Math.random() * available.length)].id);
+        autoQueue.push(available[Math.floor(Math.random() * available.length)].name);
         processAutoQueue();
-        break;
-      case '/save':
-        const content = terminal.innerText || terminal.textContent;
-        if (!content) { termError('暂无可保存的记录。'); break; }
-        localStorage.setItem(STORAGE_KEY, content);
-        termPrint('[系统] 记录已保存到浏览器缓存。', 'sys');
-        break;
-      case '/load':
-        const saved = localStorage.getItem(STORAGE_KEY);
-        if (!saved) { termError('没有找到缓存的记录。'); break; }
-        terminal.innerHTML = '';
-        const div = document.createElement('div');
-        div.style.whiteSpace = 'pre-wrap';
-        div.textContent = saved;
-        terminal.appendChild(div);
-        terminal.scrollTop = terminal.scrollHeight;
-        termPrint('[系统] 记录已从缓存恢复。', 'sys');
         break;
       case '/copy': copyTranscript(); break;
       case '/tokens': termPrint(`本局当前总 token：${totalTokens}，总花费约¥${(totalTokens * COST_PER_TOKEN).toFixed(6)}`, 'info'); break;
@@ -751,11 +729,11 @@
       const div = document.createElement('div');
       div.className = 'candidate';
       div.textContent = r.name + '（' + r.identity + '）';
-      div.dataset.roleId = r.id;
+      div.dataset.roleName = r.name;
       div.addEventListener('click', () => {
         container.querySelectorAll('.candidate').forEach(c => c.classList.remove('selected'));
         div.classList.add('selected');
-        container.dataset.selected = r.id;
+        container.dataset.selected = r.name;
       });
       container.appendChild(div);
     });
@@ -764,7 +742,7 @@
   $('submitVoteBtn').addEventListener('click', () => {
     const selected = $('voteCandidates').dataset.selected;
     if (!selected) { termError('请选择一名嫌疑人。'); return; }
-    const role = game.roles.find(r => r.id === selected);
+    const role = game.roles.find(r => r.name === selected);
     const isCorrect = (selected === game.script.murderer);
     $('voteOverlay').classList.add('hidden');
     termPrint('\n=== 投票结果 ===', 'narrator');
@@ -786,7 +764,7 @@
       const tokens = input.split(/\s+/);
       const lastToken = tokens[tokens.length-1];
       if (lastToken.startsWith('/')) {
-        const cmds = ['/help', '/role', '/search', '/vote', '/endintro', '/trigger', '/status', '/settings', '/save', '/load', '/copy', '/tokens'];
+        const cmds = ['/help', '/role', '/search', '/vote', '/endintro', '/trigger', '/status', '/settings', '/copy', '/tokens', '/brain'];
         const matches = cmds.filter(c => c.startsWith(lastToken));
         if (matches.length === 1) { tokens[tokens.length-1] = matches[0]; cmdInput.value = tokens.join(' '); }
         else if (matches.length > 1) termPrint('可能的补全：' + matches.join('  '), 'sys');
