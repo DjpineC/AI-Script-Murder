@@ -1,0 +1,896 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>CMD 剧本杀引擎</title>
+<link rel="stylesheet" href="./index.css" />
+</head>
+<body>
+<header>
+  <h1>C:\\MURDER_MYSTERY&gt; ENGINE</h1>
+  <div class="header-actions">
+    <span id="statusBar">状态：未开始</span>
+    <button id="settingsBtn">设置</button>
+  </div>
+</header>
+<div class="main">
+  <div class="terminal-wrap">
+    <div class="terminal" id="terminal"></div>
+    <div class="cmd-input-area">
+      <span class="cmd-prompt">&gt;</span>
+      <input type="text" id="cmdInput" autocomplete="off" spellcheck="false" />
+    </div>
+    <div class="mention-box" id="mentionBox"></div>
+  </div>
+  <div class="panel" id="panel">
+    <h3>角色简介</h3>
+    <div id="sidebarInfo">未开始</div>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="settingsModal">
+  <div class="modal">
+    <h2>设置 / 剧本加载</h2>
+    <label>1. 选择剧本文件夹（内含 .txt 文件）</label>
+    <div class="row">
+      <button id="chooseFolderBtn">选择文件夹</button>
+      <select id="scriptFileSelect" class="hidden"></select>
+      <button id="loadScriptBtn" class="hidden">加载选中剧本</button>
+    </div>
+    <div id="scriptInfo"></div>
+    <hr style="border-color:#0f0; margin:10px 0;">
+    <label>2. API 设置</label>
+    <label>Base URL</label>
+    <input type="text" id="baseUrl" placeholder="https://api.deepseek.com" />
+    <label>API Key</label>
+    <input type="password" id="apiKey" placeholder="sk-..." />
+    <div class="row">
+      <button id="fetchModelsBtn">获取模型</button>
+      <button id="saveSettingsBtn">保存</button>
+    </div>
+    <label>模型</label>
+    <select id="modelSelect"></select>
+    <label>打字速度（毫秒/字符，建议 20-100）</label>
+    <input type="number" id="typeSpeed" value="40" min="1" max="500" />
+    <hr style="border-color:#0f0; margin:10px 0;">
+    <label>3. 角色选择</label>
+    <div class="row">
+      <button id="selectAllRolesBtn">全选</button>
+      <button id="deselectAllRolesBtn">全不选</button>
+    </div>
+    <div class="role-select-list" id="roleSelectList" style="max-height:200px; overflow-y:auto; border:1px dashed #0f0; padding:6px;"></div>
+    <div style="margin-top:10px;">
+      <button id="startGameBtn" style="width:100%;">开始游戏</button>
+    </div>
+    <div style="margin-top:8px; text-align:right;">
+      <button id="closeSettingsBtn">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="voteOverlay">
+  <div class="modal">
+    <h2>投票：谁最可疑？</h2>
+    <div id="voteCandidates"></div>
+    <button id="submitVoteBtn" style="width:100%;margin-top:10px;">提交投票</button>
+  </div>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const terminal = $('terminal');
+  const cmdInput = $('cmdInput');
+  const mentionBox = $('mentionBox');
+  const statusBar = $('statusBar');
+  const scriptFileSelect = $('scriptFileSelect');
+  const roleSelectList = $('roleSelectList');
+  const sidebarInfo = $('sidebarInfo');
+  const settingsModal = $('settingsModal');
+  const voteOverlay = $('voteOverlay');
+
+  const STORAGE_KEY = 'murder_mystery_transcript';
+  const COST_PER_TOKEN = 0.84 / 1138567;
+
+  let scriptFiles = {};
+  let parsedScript = null;
+  let game = null;
+  let abortController = null;
+  let typeController = null;
+  let mentionActive = false;
+  let mentionItems = [];
+  let mentionSel = 0;
+  let autoQueue = [];
+  let pendingAsk = null;
+  let totalTokens = 0;
+  let memoryCounter = 0;
+
+  let settings = {
+    baseUrl: localStorage.getItem('baseUrl') || 'https://api.deepseek.com',
+    apiKey: localStorage.getItem('apiKey') || '',
+    model: localStorage.getItem('model') || '',
+    typeSpeed: parseInt(localStorage.getItem('typeSpeed') || '40')
+  };
+  $('baseUrl').value = settings.baseUrl;
+  $('apiKey').value = settings.apiKey;
+  $('typeSpeed').value = settings.typeSpeed;
+
+  function termPrint(text, cls = '') {
+    const div = document.createElement('div');
+    if (cls) div.className = cls;
+    div.textContent = text;
+    terminal.appendChild(div);
+    terminal.scrollTop = terminal.scrollHeight;
+  }
+  function termError(text) { termPrint(text, 'error'); }
+  function setStatus(text) { statusBar.textContent = '状态：' + text; }
+  function focusInput() { cmdInput.focus(); }
+
+  function typewrite(text, cls = 'ai', speed) {
+    const speedMs = speed || settings.typeSpeed || 40;
+    const div = document.createElement('div');
+    if (cls) div.className = cls;
+    terminal.appendChild(div);
+    terminal.scrollTop = terminal.scrollHeight;
+    let index = 0;
+    let cancelled = false;
+    let timer = null;
+    typeController = {
+      cancel: () => {
+        cancelled = true;
+        if (timer) clearTimeout(timer);
+        if (index < text.length) {
+          div.textContent += text.slice(index);
+          terminal.scrollTop = terminal.scrollHeight;
+        }
+        typeController = null;
+      }
+    };
+    function appendChar() {
+      if (cancelled) return;
+      if (index < text.length) {
+        div.textContent += text[index];
+        index++;
+        terminal.scrollTop = terminal.scrollHeight;
+        timer = setTimeout(appendChar, speedMs);
+      } else {
+        typeController = null;
+      }
+    }
+    appendChar();
+    return { done: new Promise(resolve => { const check = () => { if (cancelled || index >= text.length || typeController === null) resolve(); else setTimeout(check, 100); }; check(); }) };
+  }
+
+  function parseScript(content) {
+    const errors = [];
+    const s = content.replace(/\r\n/g, '\n');
+    const hasMarker = marker => s.includes(marker);
+    const extractBlock = (startMarker, endMarker) => {
+      const idx = s.indexOf(startMarker);
+      if (idx === -1) return null;
+      const after = s.slice(idx + startMarker.length);
+      const endIdx = endMarker ? after.indexOf(endMarker) : after.length;
+      return endIdx === -1 ? after.trim() : after.slice(0, endIdx).trim();
+    };
+    const extractValue = (block, key) => {
+      const re = new RegExp(`^${key}\\s*[:：]\\s*(.+)$`, 'im');
+      const m = block.match(re);
+      return m ? m[1].trim() : null;
+    };
+    const requiredMarkers = ['【剧本名称】', '【剧本简介】', '【搜证轮数】', '【旁白】', '【角色】', '【证据】', '【结局】', '【凶手】'];
+    for (const m of requiredMarkers) if (!hasMarker(m)) errors.push(`缺少必要标记：${m}`);
+    if (errors.length) throw new Error(`剧本解析失败，请检查剧本文件，建议让AI重写。\n错误详情：\n${errors.join('\n')}`);
+
+    const title = extractValue(s.split('【剧本简介】')[0], '剧本名称') || '未命名剧本';
+    const brief = extractValue(s, '剧本简介') || '';
+    const roundsText = extractValue(s, '搜证轮数');
+    if (!roundsText || isNaN(parseInt(roundsText))) throw new Error(`剧本解析失败：搜证轮数不是有效数字。`);
+    const rounds = parseInt(roundsText);
+    const narration = extractValue(s, '旁白') || '';
+    const murdererRaw = extractValue(s, '凶手') || '';
+    const murdererName = murdererRaw.split(/[:：]/)[0]?.trim() || murdererRaw.trim();
+
+    const rolesBlock = extractBlock('【角色】', '【证据】');
+    if (!rolesBlock) throw new Error(`剧本解析失败：未找到【角色】到【证据】之间的内容。`);
+    const roleChunks = rolesBlock.split(/===([^=]+)===/).filter(str => str.trim() !== '');
+    if (roleChunks.length < 2 || roleChunks.length % 2 !== 0) throw new Error(`剧本解析失败：角色区块格式不正确。`);
+    const roles = [];
+    for (let i = 0; i < roleChunks.length; i += 2) {
+      const roleTitle = roleChunks[i].trim();
+      const roleBody = roleChunks[i+1];
+      const name = extractValue(roleBody, '名字') || roleTitle;
+      const identity = extractValue(roleBody, '身份') || '';
+      const goal = extractValue(roleBody, '目标') || '';
+      const secret = extractValue(roleBody, '隐藏故事') || '';
+      const prompt = extractValue(roleBody, '初始提示词') || '';
+      if (!name || !identity || !goal || !secret || !prompt) throw new Error(`剧本解析失败：角色「${roleTitle}」缺少必要字段。`);
+      roles.push({ id: name, title: roleTitle, name, identity, goal, secret, prompt, isPlayer: false, longTermMemory: '' });
+    }
+    if (roles.length < 2) throw new Error(`剧本解析失败：至少需要2个角色。`);
+
+    const evidenceBlock = extractBlock('【证据】', '【结局】');
+    if (!evidenceBlock) throw new Error(`剧本解析失败：未找到【证据】部分。`);
+    const evidenceChunks = evidenceBlock.split(/===第(\d+)轮===/).filter(str => str.trim() !== '');
+    if (evidenceChunks.length < 2) throw new Error(`剧本解析失败：证据区块格式不正确。`);
+    const evidenceRounds = [];
+    for (let i = 0; i < evidenceChunks.length; i += 2) {
+      const roundNum = parseInt(evidenceChunks[i]);
+      const content = evidenceChunks[i+1]?.trim();
+      if (!roundNum || !content) throw new Error(`剧本解析失败：证据第${evidenceChunks[i]}轮内容为空。`);
+      const items = content.split(/\n+/).map(l => l.trim()).filter(l => l);
+      if (items.length === 0) throw new Error(`剧本解析失败：证据第${roundNum}轮没有任何证据。`);
+      evidenceRounds[roundNum-1] = items;
+    }
+    if (evidenceRounds.length !== rounds) throw new Error(`剧本解析失败：搜证轮数与证据轮数不一致。`);
+
+    const endingBlock = extractBlock('【结局】', null);
+    if (!endingBlock) throw new Error(`剧本解析失败：未找到【结局】部分。`);
+    const truth = extractValue(endingBlock, '真相') || '';
+    const storyEnd = extractValue(endingBlock, '结局故事') || '';
+    if (!truth || !storyEnd) throw new Error(`剧本解析失败：结局部分缺少必要字段。`);
+
+    return { title, brief, rounds, narration, roles, evidenceRounds, murderer: murdererName, truth, storyEnd };
+  }
+
+  function autoRestoreTranscript() {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) {
+      terminal.innerHTML = '';
+      const div = document.createElement('div');
+      div.style.whiteSpace = 'pre-wrap';
+      div.textContent = saved;
+      terminal.appendChild(div);
+      terminal.scrollTop = terminal.scrollHeight;
+      termPrint('[系统] 已自动恢复上次游戏记录。', 'sys');
+    }
+  }
+
+  $('chooseFolderBtn').addEventListener('click', () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.webkitdirectory = true;
+    input.directory = true;
+    input.addEventListener('change', async (e) => {
+      const files = e.target.files;
+      scriptFiles = {};
+      scriptFileSelect.innerHTML = '';
+      for (const file of files) {
+        if (file.name.toLowerCase().endsWith('.txt')) {
+          try {
+            const text = await file.text();
+            scriptFiles[file.name] = text;
+            const opt = document.createElement('option');
+            opt.value = file.name;
+            opt.textContent = file.name;
+            scriptFileSelect.appendChild(opt);
+          } catch (err) { console.error(err); }
+        }
+      }
+      if (Object.keys(scriptFiles).length === 0) {
+        $('scriptInfo').textContent = '未找到 .txt 剧本文件';
+        scriptFileSelect.classList.add('hidden');
+        $('loadScriptBtn').classList.add('hidden');
+      } else {
+        scriptFileSelect.classList.remove('hidden');
+        $('loadScriptBtn').classList.remove('hidden');
+        $('scriptInfo').textContent = `已读取 ${Object.keys(scriptFiles).length} 个文件`;
+      }
+    });
+    input.click();
+  });
+
+  $('loadScriptBtn').addEventListener('click', () => {
+    const fname = scriptFileSelect.value;
+    if (!fname || !scriptFiles[fname]) {
+      $('scriptInfo').textContent = '请先选择剧本文件';
+      return;
+    }
+    try {
+      parsedScript = parseScript(scriptFiles[fname]);
+      $('scriptInfo').textContent = `剧本「${parsedScript.title}」解析成功！`;
+      renderRoleSelect();
+      setStatus('剧本已加载');
+    } catch (e) {
+      $('scriptInfo').textContent = e.message;
+      setStatus('剧本解析失败');
+    }
+  });
+
+  function renderRoleSelect() {
+    if (!parsedScript) return;
+    roleSelectList.innerHTML = '';
+    parsedScript.roles.forEach(role => {
+      const label = document.createElement('label');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = false;
+      cb.dataset.roleId = role.id;
+      cb.addEventListener('change', () => updateRolePlayStatus());
+      label.appendChild(cb);
+      label.appendChild(document.createTextNode(`${role.name}（${role.identity}）`));
+      roleSelectList.appendChild(label);
+    });
+  }
+  function updateRolePlayStatus() {
+    if (!parsedScript) return;
+    const checkboxes = roleSelectList.querySelectorAll('input[type="checkbox"]');
+    checkboxes.forEach(cb => {
+      const role = parsedScript.roles.find(r => r.id === cb.dataset.roleId);
+      if (role) role.isPlayer = cb.checked;
+    });
+  }
+  $('selectAllRolesBtn').addEventListener('click', () => {
+    roleSelectList.querySelectorAll('input[type="checkbox"]').forEach(cb => cb.checked = true);
+    updateRolePlayStatus();
+  });
+  $('deselectAllRolesBtn').addEventListener('click', () => {
+    roleSelectList.querySelectorAll('input[type="checkbox"]').forEach(cb => cb.checked = false);
+    updateRolePlayStatus();
+  });
+
+  $('saveSettingsBtn').addEventListener('click', () => {
+    settings.baseUrl = $('baseUrl').value.trim().replace(/\/$/, '');
+    settings.apiKey = $('apiKey').value.trim();
+    settings.model = $('modelSelect').value;
+    settings.typeSpeed = parseInt($('typeSpeed').value) || 40;
+    localStorage.setItem('baseUrl', settings.baseUrl);
+    localStorage.setItem('apiKey', settings.apiKey);
+    localStorage.setItem('model', settings.model);
+    localStorage.setItem('typeSpeed', settings.typeSpeed);
+    termPrint('设置已保存。', 'sys');
+  });
+  $('fetchModelsBtn').addEventListener('click', async () => {
+    const base = $('baseUrl').value.trim().replace(/\/$/, '');
+    const key = $('apiKey').value.trim();
+    if (!base || !key) { termError('请先填写 Base URL 和 API Key。'); return; }
+    try {
+      const res = await fetch(`${base}/models`, { headers: { 'Authorization': `Bearer ${key}` } });
+      if (!res.ok) throw new Error(`获取模型失败：HTTP ${res.status}`);
+      const data = await res.json();
+      const models = data.data.map(m => m.id).sort();
+      const sel = $('modelSelect');
+      sel.innerHTML = '';
+      models.forEach(m => {
+        const opt = document.createElement('option');
+        opt.value = m;
+        opt.textContent = m;
+        sel.appendChild(opt);
+      });
+      if (models.length) {
+        sel.value = settings.model && models.includes(settings.model) ? settings.model : models[0];
+        termPrint(`获取到 ${models.length} 个模型。`, 'info');
+      }
+    } catch (e) { termError(e.message); }
+  });
+  if (settings.model) {
+    const opt = document.createElement('option');
+    opt.value = settings.model;
+    opt.textContent = settings.model;
+    $('modelSelect').appendChild(opt);
+  }
+
+  $('settingsBtn').addEventListener('click', () => settingsModal.classList.remove('hidden'));
+  $('closeSettingsBtn').addEventListener('click', () => settingsModal.classList.add('hidden'));
+
+  $('startGameBtn').addEventListener('click', () => {
+    if (!parsedScript) { termError('请先加载剧本。'); return; }
+    const selected = parsedScript.roles.filter(r => r.isPlayer);
+    if (selected.length === 0) { termError('请至少选择一个角色由玩家扮演。'); return; }
+    if (!$('baseUrl').value.trim() || !$('apiKey').value.trim() || !$('modelSelect').value) { termError('请先填写 API 设置并选择模型。'); return; }
+    settings.baseUrl = $('baseUrl').value.trim().replace(/\/$/, '');
+    settings.apiKey = $('apiKey').value.trim();
+    settings.model = $('modelSelect').value;
+    settings.typeSpeed = parseInt($('typeSpeed').value) || 40;
+    localStorage.setItem('baseUrl', settings.baseUrl);
+    localStorage.setItem('apiKey', settings.apiKey);
+    localStorage.setItem('model', settings.model);
+    localStorage.setItem('typeSpeed', settings.typeSpeed);
+
+    game = {
+      script: parsedScript,
+      roles: parsedScript.roles.map(r => ({ ...r, isPlayer: r.isPlayer, longTermMemory: '' })),
+      stage: 'intro',
+      round: 0,
+      publicHistory: [],
+      currentSpeaker: null,
+      hasIntroduced: new Set(),
+    };
+    totalTokens = 0;
+    memoryCounter = 0;
+    autoQueue = [];
+    pendingAsk = null;
+    settingsModal.classList.add('hidden');
+    updateSidebar();
+    terminal.innerHTML = '';
+    termPrint(`=== 剧本「${game.script.title}」开始 ===`, 'narrator');
+    termPrint(`旁白：${game.script.narration}`, 'narrator');
+    game.publicHistory.push({ speaker: 'system', content: `旁白：${game.script.narration}` });
+    termPrint('进入自我介绍阶段。输入 /help 查看命令。', 'info');
+    setStatus('游戏进行中');
+    focusInput();
+  });
+
+  function updateSidebar() {
+    if (!game) { sidebarInfo.innerHTML = '未开始'; return; }
+    let html = '<h3>我的角色</h3>';
+    game.roles.filter(r => r.isPlayer).forEach(role => {
+      html += `<div class="role-card">
+        <div class="role-name">${role.name}</div>
+        <div class="role-identity">${role.identity}</div>
+        <div>目标：${role.goal}</div>
+        <div class="role-secret">隐藏：${role.secret}</div>
+      </div>`;
+    });
+    html += '<h3>其他角色</h3>';
+    game.roles.filter(r => !r.isPlayer).forEach(role => {
+      html += `<div class="role-card">
+        <div class="role-name">${role.name}</div>
+        <div class="role-identity">${role.identity}</div>
+      </div>`;
+    });
+    html += '<h3>公开证据</h3>';
+    if (game.round > 0 && game.script.evidenceRounds[game.round-1]) {
+      game.script.evidenceRounds[game.round-1].forEach(ev => { html += `<div class="evidence-item">- ${ev}</div>`; });
+    } else {
+      html += '<div>尚未公开证据</div>';
+    }
+    sidebarInfo.innerHTML = html;
+  }
+
+  async function processAutoQueue() {
+    if (!game || game.currentSpeaker || pendingAsk) return;
+    if (autoQueue.length === 0) return;
+    const roleId = autoQueue.shift();
+    await generateAiSpeech(roleId);
+    if (autoQueue.length > 0 && !pendingAsk) processAutoQueue();
+  }
+
+  async function fetchAiContent(roleId, messages) {
+    const res = await fetch(`${settings.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${settings.apiKey}` },
+      body: JSON.stringify({ model: settings.model, messages, temperature: 0.9, max_tokens: 200, stream: false }),
+      signal: abortController.signal
+    });
+    if (!res.ok) throw new Error(`API错误 ${res.status}`);
+    const data = await res.json();
+    return { content: (data.choices?.[0]?.message?.content || '').trim(), usage: data.usage || {} };
+  }
+
+  async function updateMemory(roleId, content) {
+    if (!game || !settings.apiKey || !settings.model) return;
+    const role = game.roles.find(r => r.id === roleId);
+    if (!role) return;
+    const recentMessages = game.publicHistory.slice(-5).map(entry => {
+      if (entry.speaker === 'system') return `系统：${entry.content}`;
+      const speakerName = game.roles.find(r => r.id === entry.speaker)?.name || entry.speaker;
+      return `${speakerName}：${entry.content}`;
+    }).join('\n');
+    const systemPrompt = `你是剧本杀角色「${role.name}」。请更新你的长期记忆摘要，只输出摘要本身。\n旧摘要：${role.longTermMemory || '无'}\n\n最近对话：\n${recentMessages}\n\n新摘要要求：包含公开行动、你撒过的谎、对你不利的证据、你怀疑谁、谁怀疑你。`;
+    try {
+      const res = await fetch(`${settings.baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${settings.apiKey}` },
+        body: JSON.stringify({ model: settings.model, messages: [{ role: 'system', content: systemPrompt }], temperature: 0.3, max_tokens: 100, stream: false })
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.usage) totalTokens += data.usage.total_tokens || 0;
+      const memoryContent = (data.choices?.[0]?.message?.content || '').trim();
+      if (memoryContent) role.longTermMemory = memoryContent;
+    } catch (e) {}
+  }
+
+  async function generateAiSpeech(roleId) {
+    const role = game.roles.find(r => r.id === roleId);
+    if (!role) return;
+    if (!settings.apiKey || !settings.model) { termError('缺少 API 设置'); return; }
+    const messages = buildAiMessages(roleId);
+    abortController = new AbortController();
+    game.currentSpeaker = roleId;
+    termPrint(`[系统] ${role.name} 正在输入...`, 'sys');
+    let content = '';
+    let usage = {};
+    try {
+      const result = await fetchAiContent(roleId, messages);
+      content = result.content;
+      usage = result.usage;
+      totalTokens += usage.total_tokens || 0;
+      if (!content) content = '（沉默）';
+      termPrint(`${role.name}：`, 'ai');
+      await typewrite(content, 'ai', settings.typeSpeed).done;
+      recordSpeech(roleId, content);
+      termPrint(`（本次：${usage.total_tokens || 0} token，总token：${totalTokens}，总花费约¥${(totalTokens * COST_PER_TOKEN).toFixed(6)}）`, 'sys');
+
+      const mentionRegex = /@([^\s@]+)/g;
+      const mentions = [];
+      let m;
+      while ((m = mentionRegex.exec(content)) !== null) mentions.push(m[1]);
+      if (mentions.length > 0) {
+        for (const name of mentions) {
+          if (name === '所有人') continue;
+          const targetRole = game.roles.find(r => r.name === name && !r.isPlayer);
+          if (targetRole && targetRole.id !== roleId) {
+            pendingAsk = { roleId, targetRoleId: targetRole.id };
+            termPrint(`[系统] ${role.name} 想 @ ${targetRole.name}，允许发言吗？(0同意 1拒绝)`, 'prompt');
+            focusInput();
+            return;
+          }
+        }
+      }
+    } catch (e) {
+      content = '（沉默）';
+      termPrint(`${role.name}：`, 'ai');
+      await typewrite(content, 'ai', settings.typeSpeed).done;
+      recordSpeech(roleId, content);
+      termPrint(`（请求失败，总token：${totalTokens}，总花费约¥${(totalTokens * COST_PER_TOKEN).toFixed(6)}）`, 'sys');
+    } finally {
+      game.currentSpeaker = null;
+      abortController = null;
+      if (content && content !== '（沉默）') {
+        memoryCounter++;
+        if (memoryCounter % 3 === 0) updateMemory(roleId, content);
+      }
+      if (!pendingAsk && autoQueue.length > 0) processAutoQueue();
+    }
+  }
+
+  function buildAiMessages(roleId) {
+    const role = game.roles.find(r => r.id === roleId);
+    const otherRoles = game.roles.filter(r => r.id !== roleId).map(r => `${r.name}（${r.identity}）`).join('、');
+    let currentEvidence = '（暂无公开证据）';
+    if (game.round > 0 && game.script.evidenceRounds[game.round-1]) {
+      currentEvidence = game.script.evidenceRounds[game.round-1].join('；');
+    }
+    const fixedPrompt = `你是剧本杀游戏《${game.script.title}》中的角色「${role.name}」。\n` +
+      `公开身份：${role.identity}\n` +
+      `个人目标：${role.goal}\n` +
+      `隐藏秘密：${role.secret}\n` +
+      `初始提示词：${role.prompt}\n` +
+      `当前阶段：${game.stage}\n` +
+      `公共背景：${game.script.brief}\n` +
+      `其他角色：${otherRoles}\n` +
+      `当前证据：${currentEvidence}\n` +
+      `长期记忆：${role.longTermMemory || '无'}\n` +
+      `规则：你是一个真人玩家，不要暴露自己是AI。可以推理、怀疑、辩解、撒谎，但不要主动承认自己是凶手。发言要简短自然，像日常对话，优先回应玩家最近的发言。`;
+
+    const recentEntries = game.publicHistory.slice(-5);
+    const recentTranscript = recentEntries.map(entry => {
+      if (entry.speaker === 'system') return `系统：${entry.content}`;
+      const speakerName = game.roles.find(r => r.id === entry.speaker)?.name || entry.speaker;
+      return `${speakerName}：${entry.content}`;
+    }).join('\n');
+
+    return [
+      { role: 'system', content: fixedPrompt },
+      { role: 'user', content: `最近对话：\n${recentTranscript}\n\n现在轮到你发言，请简短自然地发言。` }
+    ];
+  }
+
+  function recordSpeech(roleId, content) {
+    game.publicHistory.push({ speaker: roleId, content });
+  }
+
+  function enterRound(roundNum) {
+    if (!game) return;
+    game.round = roundNum;
+    game.stage = 'investigation';
+    termPrint(`\n=== 第 ${roundNum} 轮搜证开始 ===`, 'narrator');
+    const evidence = game.script.evidenceRounds[roundNum-1];
+    if (evidence) {
+      termPrint(`【第${roundNum}轮证据公开】`, 'evidence');
+      evidence.forEach(ev => termPrint(ev, 'evidence'));
+      game.publicHistory.push({ speaker: 'system', content: `【第${roundNum}轮证据公开】\n${evidence.join('\n')}` });
+    }
+    game.currentSpeaker = null;
+    autoQueue = [];
+    pendingAsk = null;
+    updateSidebar();
+    if (roundNum === game.script.rounds) termPrint(`本轮为最后一轮搜证。讨论结束后可输入 /vote 进入投票。`, 'info');
+    else termPrint(`本轮讨论中，可输入 /search 进入下一轮搜证。`, 'info');
+  }
+
+  function endIntro() {
+    if (!game || game.stage !== 'intro') return;
+    enterRound(1);
+  }
+
+  function sendPlayerMessage(content) {
+    if (!game) { termError('游戏尚未开始。'); return; }
+    content = content.trim();
+    if (!content) return;
+
+    if (pendingAsk) {
+      if (content === '0' || content === '1') {
+        const targetRoleId = pendingAsk.targetRoleId;
+        const targetRole = game.roles.find(r => r.id === targetRoleId);
+        const asker = game.roles.find(r => r.id === pendingAsk.roleId);
+        pendingAsk = null;
+        if (content === '0') {
+          termPrint(`[系统] 已同意 ${asker.name} 的 @，${targetRole.name} 将发言。`, 'sys');
+          autoQueue.unshift(targetRoleId);
+        } else {
+          termPrint(`[系统] 已拒绝 ${asker.name} 的 @。`, 'sys');
+        }
+        focusInput();
+        processAutoQueue();
+        return;
+      } else {
+        termPrint('[系统] 请输入 0 同意或 1 拒绝。', 'sys');
+        focusInput();
+        return;
+      }
+    }
+
+    if (content.startsWith('/')) { handleCommand(content); return; }
+
+    if (game.currentSpeaker) {
+      termPrint('[系统] 当前 AI 正在发言，你的消息将在其发言结束后自动显示。', 'sys');
+      setTimeout(() => sendPlayerMessage(content), 500);
+      return;
+    }
+
+    const roleId = game.currentRoleId || game.roles.filter(r => r.isPlayer)[0]?.id;
+    const role = game.roles.find(r => r.id === roleId);
+    if (!role) { termError('请先选择当前发言身份，使用 /role 名字'); return; }
+    termPrint(`${role.name}：${content}`, 'player');
+    recordSpeech(roleId, content);
+    updateSidebar();
+
+    const mentionRegex = /@([^\s@]+)/g;
+    const mentions = [];
+    let match;
+    while ((match = mentionRegex.exec(content)) !== null) mentions.push(match[1]);
+
+    if (mentions.includes('所有人')) {
+      autoQueue = game.roles.filter(r => !r.isPlayer).map(r => r.id);
+      processAutoQueue();
+      return;
+    }
+
+    if (mentions.length > 0) {
+      const targetIds = [];
+      mentions.forEach(name => {
+        if (name === '所有人') return;
+        const mentionedRole = game.roles.find(r => r.name === name && !r.isPlayer);
+        if (mentionedRole && !targetIds.includes(mentionedRole.id)) targetIds.push(mentionedRole.id);
+      });
+      if (targetIds.length > 0) { autoQueue = targetIds; processAutoQueue(); }
+    }
+  }
+
+  function handleCommand(cmd) {
+    const parts = cmd.trim().split(/\s+/);
+    const main = parts[0].toLowerCase();
+    switch (main) {
+      case '/help': termPrint('/help /role /endintro /search /vote /trigger /save /load /copy /tokens /status /settings', 'sys'); break;
+      case '/role':
+        if (parts.length < 2) { termError('用法：/role 角色名字'); break; }
+        const name = parts.slice(1).join(' ');
+        const role = game.roles.find(r => r.isPlayer && r.name === name);
+        if (!role) { termError(`找不到该玩家角色：${name}`); break; }
+        game.currentRoleId = role.id;
+        termPrint(`[系统] 当前发言身份切换为 ${role.name}`, 'sys');
+        updateSidebar();
+        break;
+      case '/endintro': endIntro(); break;
+      case '/search':
+        if (!game) { termError('游戏未开始。'); break; }
+        if (game.stage !== 'investigation') { termError('当前不在搜证阶段。'); break; }
+        if (game.round >= game.script.rounds) { termError('已是最后一轮搜证。'); break; }
+        enterRound(game.round + 1);
+        break;
+      case '/vote':
+        if (!game) { termError('游戏未开始。'); break; }
+        if ((game.stage === 'investigation' && game.round === game.script.rounds) || game.stage === 'discussion') openVote();
+        else termError('当前不能投票。');
+        break;
+      case '/trigger':
+        if (!game) { termError('游戏未开始。'); break; }
+        const available = game.roles.filter(r => !r.isPlayer && !autoQueue.includes(r.id) && game.currentSpeaker !== r.id);
+        if (available.length === 0) { termPrint('暂无可请求发言的 AI。', 'sys'); break; }
+        autoQueue.push(available[Math.floor(Math.random() * available.length)].id);
+        processAutoQueue();
+        break;
+      case '/save':
+        const content = terminal.innerText || terminal.textContent;
+        if (!content) { termError('暂无可保存的记录。'); break; }
+        localStorage.setItem(STORAGE_KEY, content);
+        termPrint('[系统] 记录已保存到浏览器缓存。', 'sys');
+        break;
+      case '/load':
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (!saved) { termError('没有找到缓存的记录。'); break; }
+        terminal.innerHTML = '';
+        const div = document.createElement('div');
+        div.style.whiteSpace = 'pre-wrap';
+        div.textContent = saved;
+        terminal.appendChild(div);
+        terminal.scrollTop = terminal.scrollHeight;
+        termPrint('[系统] 记录已从缓存恢复。', 'sys');
+        break;
+      case '/copy': copyTranscript(); break;
+      case '/tokens': termPrint(`本局当前总 token：${totalTokens}，总花费约¥${(totalTokens * COST_PER_TOKEN).toFixed(6)}`, 'info'); break;
+      case '/status':
+        if (!game) { termError('游戏未开始。'); break; }
+        updateSidebar();
+        termPrint(sidebarInfo.textContent, 'sys');
+        break;
+      case '/settings': settingsModal.classList.remove('hidden'); break;
+      default: termError('未知命令，输入 /help 查看帮助。');
+    }
+  }
+
+  function copyTranscript() {
+    const content = terminal.innerText || terminal.textContent;
+    if (!content) { termError('暂无可复制的记录。'); return; }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(content).then(() => termPrint('[系统] 全部记录已复制到剪贴板。', 'sys'))
+        .catch(err => termError('复制失败：' + err.message));
+    } else {
+      const textarea = document.createElement('textarea');
+      textarea.value = content;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      termPrint('[系统] 全部记录已复制到剪贴板。', 'sys');
+    }
+  }
+
+  function openVote() {
+    if (!game) return;
+    game.stage = 'voting';
+    updateSidebar();
+    const overlay = $('voteOverlay');
+    overlay.classList.remove('hidden');
+    const container = $('voteCandidates');
+    container.innerHTML = '';
+    game.roles.forEach(r => {
+      const div = document.createElement('div');
+      div.className = 'candidate';
+      div.textContent = r.name + '（' + r.identity + '）';
+      div.dataset.roleId = r.id;
+      div.addEventListener('click', () => {
+        container.querySelectorAll('.candidate').forEach(c => c.classList.remove('selected'));
+        div.classList.add('selected');
+        container.dataset.selected = r.id;
+      });
+      container.appendChild(div);
+    });
+  }
+
+  $('submitVoteBtn').addEventListener('click', () => {
+    const selected = $('voteCandidates').dataset.selected;
+    if (!selected) { termError('请选择一名嫌疑人。'); return; }
+    const role = game.roles.find(r => r.id === selected);
+    const isCorrect = (selected === game.script.murderer);
+    $('voteOverlay').classList.add('hidden');
+    termPrint('\n=== 投票结果 ===', 'narrator');
+    termPrint(`你投给了：${role.name}`, 'info');
+    termPrint(isCorrect ? '恭喜！你投对了！' : `很遗憾，你投错了。真正的凶手是：${game.script.murderer}`, isCorrect ? 'info' : 'warn');
+    termPrint('\n=== 真相揭晓 ===', 'narrator');
+    termPrint(game.script.truth, 'evidence');
+    termPrint('\n=== 结局 ===', 'narrator');
+    termPrint(game.script.storyEnd, 'info');
+    game.stage = 'ended';
+    updateSidebar();
+    setStatus('游戏结束');
+  });
+
+  cmdInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      const input = cmdInput.value;
+      const tokens = input.split(/\s+/);
+      const lastToken = tokens[tokens.length-1];
+      if (lastToken.startsWith('/')) {
+        const cmds = ['/help', '/role', '/search', '/vote', '/endintro', '/trigger', '/status', '/settings', '/save', '/load', '/copy', '/tokens'];
+        const matches = cmds.filter(c => c.startsWith(lastToken));
+        if (matches.length === 1) { tokens[tokens.length-1] = matches[0]; cmdInput.value = tokens.join(' '); }
+        else if (matches.length > 1) termPrint('可能的补全：' + matches.join('  '), 'sys');
+      } else if (lastToken.startsWith('@')) {
+        const query = lastToken.slice(1).toLowerCase();
+        const allRoles = game ? game.roles.filter(r => !r.isPlayer).map(r => r.name) : [];
+        const matches = allRoles.filter(name => name.toLowerCase().startsWith(query));
+        if (matches.length === 1) { tokens[tokens.length-1] = '@' + matches[0]; cmdInput.value = tokens.join(' '); }
+        else { if (!mentionActive) openMentionBox(); else { mentionSel = (mentionSel + 1) % mentionItems.length; updateMentionBox(); } }
+      }
+      return;
+    }
+    if (mentionActive && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+      e.preventDefault();
+      mentionSel = e.key === 'ArrowUp' ? (mentionSel - 1 + mentionItems.length) % mentionItems.length : (mentionSel + 1) % mentionItems.length;
+      updateMentionBox();
+      return;
+    }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (mentionActive) { chooseMentionItem(mentionItems[mentionSel]); return; }
+      const content = cmdInput.value;
+      cmdInput.value = '';
+      sendPlayerMessage(content);
+    }
+    if (e.key === 'Escape' && mentionActive) closeMentionBox();
+    if (e.key === '@') {
+      setTimeout(() => {
+        const val = cmdInput.value;
+        const cursor = cmdInput.selectionStart;
+        const before = val.slice(0, cursor);
+        if (before.endsWith('@')) openMentionBox();
+      }, 0);
+    }
+  });
+
+  cmdInput.addEventListener('input', () => {
+    if (mentionActive) {
+      const val = cmdInput.value;
+      const cursor = cmdInput.selectionStart;
+      const before = val.slice(0, cursor);
+      const atIdx = before.lastIndexOf('@');
+      if (atIdx === -1 || before.slice(atIdx+1).includes(' ')) closeMentionBox();
+      else filterMentionItems(before.slice(atIdx+1).toLowerCase());
+    } else {
+      const val = cmdInput.value;
+      const cursor = cmdInput.selectionStart;
+      const before = val.slice(0, cursor);
+      const atIdx = before.lastIndexOf('@');
+      if (atIdx !== -1 && !before.slice(atIdx+1).includes(' ')) openMentionBox();
+    }
+  });
+
+  terminal.addEventListener('click', () => focusInput());
+
+  function openMentionBox() {
+    if (!game) return;
+    mentionItems = ['所有人', ...game.roles.filter(r => !r.isPlayer).map(r => r.name)];
+    mentionSel = 0;
+    mentionActive = true;
+    filterMentionItems('');
+    updateMentionBox();
+    mentionBox.style.display = 'block';
+  }
+  function closeMentionBox() { mentionActive = false; mentionBox.style.display = 'none'; }
+  function filterMentionItems(query) {
+    if (!mentionActive) return;
+    mentionItems = ['所有人', ...game.roles.filter(r => !r.isPlayer).map(r => r.name)].filter(name => name.toLowerCase().includes(query.toLowerCase()));
+    if (mentionSel >= mentionItems.length) mentionSel = 0;
+    updateMentionBox();
+  }
+  function updateMentionBox() {
+    mentionBox.innerHTML = '';
+    if (mentionItems.length === 0) { mentionBox.style.display = 'none'; return; }
+    mentionItems.forEach((name, idx) => {
+      const div = document.createElement('div');
+      div.className = 'mention-item' + (idx === mentionSel ? ' active' : '');
+      div.textContent = name;
+      div.addEventListener('click', () => chooseMentionItem(name));
+      mentionBox.appendChild(div);
+    });
+  }
+  function chooseMentionItem(name) {
+    if (!mentionActive) return;
+    closeMentionBox();
+    const val = cmdInput.value;
+    const cursor = cmdInput.selectionStart;
+    const before = val.slice(0, cursor);
+    const atIdx = before.lastIndexOf('@');
+    if (atIdx !== -1) {
+      cmdInput.value = before.slice(0, atIdx) + '@' + name + ' ' + val.slice(cursor);
+      cmdInput.selectionStart = cmdInput.selectionEnd = atIdx + name.length + 2;
+    } else {
+      cmdInput.value += '@' + name + ' ';
+    }
+    focusInput();
+  }
+
+  autoRestoreTranscript();
+
+  termPrint('C:\\MURDER_MYSTERY> 引擎就绪。', 'sys');
+  termPrint('请先打开设置（点击右上角“设置”按钮），加载剧本并配置 API。', 'sys');
+  focusInput();
+})();
+</script>
+</body>
+</html>

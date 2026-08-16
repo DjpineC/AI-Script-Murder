@@ -1,0 +1,244 @@
+:root {
+    --bg: #000;
+    --fg: #0f0;
+    --dim: #0a0;
+    --warn: #ff0;
+    --err: #f00;
+    --panel: #001100;
+    --border: #0f0;
+  }
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: "Courier New", Consolas, monospace;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    font-size: 14px;
+  }
+  header {
+    border-bottom: 1px solid var(--border);
+    padding: 6px 12px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-shrink: 0;
+    background: #001800;
+  }
+  header h1 {
+    font-size: 18px;
+    letter-spacing: 2px;
+    white-space: nowrap;
+  }
+  header .header-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .main {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+  }
+  .terminal-wrap {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    border-right: 1px solid var(--border);
+    position: relative;
+  }
+  .terminal {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: #000;
+    cursor: text;
+  }
+  .terminal .sys { color: var(--dim); }
+  .terminal .narrator { color: #7cfc00; font-weight: bold; }
+  .terminal .ai { color: #00e5ff; }
+  .terminal .player { color: #ffd700; }
+  .terminal .error { color: var(--err); }
+  .terminal .evidence { color: #ff9f00; }
+  .terminal .info { color: #adff2f; }
+  .terminal .warn { color: var(--warn); }
+  .terminal .prompt { color: #fff; }
+  .cmd-input-area {
+    display: flex;
+    align-items: center;
+    padding: 4px 12px 8px;
+    background: #000;
+    border-top: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .cmd-prompt {
+    color: #0f0;
+    margin-right: 6px;
+    white-space: nowrap;
+  }
+  #cmdInput {
+    flex: 1;
+    background: transparent;
+    color: var(--fg);
+    border: none;
+    outline: none;
+    font-family: inherit;
+    font-size: 14px;
+    caret-color: #0f0;
+    padding: 0;
+  }
+  .mention-box {
+    position: absolute;
+    bottom: 30px;
+    left: 30px;
+    background: #000;
+    border: 1px solid var(--border);
+    z-index: 50;
+    min-width: 200px;
+    max-height: 200px;
+    overflow-y: auto;
+    display: none;
+  }
+  .mention-box .mention-item {
+    padding: 4px 8px;
+    cursor: pointer;
+  }
+  .mention-box .mention-item.active {
+    background: #0f0;
+    color: #000;
+  }
+  .panel {
+    width: 300px;
+    flex-shrink: 0;
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+    overflow-y: auto;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .panel h3 {
+    border-bottom: 1px dashed var(--border);
+    padding-bottom: 4px;
+    margin-bottom: 6px;
+    font-size: 15px;
+  }
+  .panel .role-card {
+    border: 1px dashed var(--border);
+    padding: 6px;
+    margin-bottom: 6px;
+    background: #000;
+    font-size: 13px;
+  }
+  .panel .role-card .role-name {
+    color: #ffd700;
+    font-weight: bold;
+  }
+  .panel .role-card .role-identity {
+    color: #00e5ff;
+  }
+  .panel .role-card .role-secret {
+    color: #ff9f00;
+  }
+  .panel .evidence-item {
+    margin: 3px 0;
+    color: #ff9f00;
+  }
+  .panel .status-item {
+    margin: 3px 0;
+    color: #adff2f;
+  }
+  .modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0,0,0,0.85);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+  }
+  .modal {
+    background: #000;
+    border: 1px solid var(--border);
+    padding: 20px;
+    width: 90%;
+    max-width: 500px;
+    max-height: 90vh;
+    overflow-y: auto;
+  }
+  .modal h2 {
+    margin-bottom: 12px;
+    text-align: center;
+  }
+  .modal label {
+    display: block;
+    margin: 8px 0 4px;
+    font-size: 13px;
+  }
+  .modal input[type="text"],
+  .modal input[type="password"],
+  .modal input[type="number"],
+  .modal select {
+    width: 100%;
+    background: #000;
+    color: var(--fg);
+    border: 1px solid var(--border);
+    padding: 6px;
+    font-family: inherit;
+    font-size: 13px;
+    outline: none;
+    margin-bottom: 6px;
+  }
+  .modal .row {
+    display: flex;
+    gap: 6px;
+  }
+  .modal .row button {
+    flex: 1;
+  }
+  .modal button {
+    background: #000;
+    color: var(--fg);
+    border: 1px solid var(--border);
+    padding: 6px 10px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 13px;
+  }
+  .modal button:hover {
+    background: #0f0;
+    color: #000;
+  }
+  .modal .candidate {
+    display: block;
+    margin: 8px 0;
+    padding: 8px;
+    border: 1px solid var(--border);
+    cursor: pointer;
+  }
+  .modal .candidate:hover {
+    background: #0f0;
+    color: #000;
+  }
+  .modal .candidate.selected {
+    background: #0f0;
+    color: #000;
+  }
+  .hidden { display: none; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: #000; }
+  ::-webkit-scrollbar-thumb { background: #0f0; }
