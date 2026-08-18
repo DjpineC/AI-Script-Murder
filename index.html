@@ -92,6 +92,7 @@
 
   const STORAGE_KEY = 'murder_mystery_transcript';
   const COST_PER_TOKEN = 0.84 / 1138567;
+  const MEMORY_INTERVAL = 10;
 
   let scriptFiles = {};
   let parsedScript = null;
@@ -106,6 +107,10 @@
   let totalTokens = 0;
   let totalCacheHitTokens = 0;
   let totalCacheMissTokens = 0;
+  let memoryTokenCost = 0;
+  let memoryCacheHitTokens = 0;
+  let memoryCacheMissTokens = 0;
+  let dialogCounter = 0;
 
   let settings = {
     baseUrl: localStorage.getItem('baseUrl') || 'https://api.deepseek.com',
@@ -181,7 +186,6 @@
       }
       r.isPlayer = false;
       r.longTermMemory = '';
-      r.memoryCounter = 0;
     });
     return data;
   }
@@ -352,6 +356,10 @@
     totalTokens = 0;
     totalCacheHitTokens = 0;
     totalCacheMissTokens = 0;
+    memoryTokenCost = 0;
+    memoryCacheHitTokens = 0;
+    memoryCacheMissTokens = 0;
+    dialogCounter = 0;
     autoQueue = [];
     pendingAsk = null;
     settingsModal.classList.add('hidden');
@@ -400,11 +408,11 @@
     if (autoQueue.length > 0 && !pendingAsk) processAutoQueue();
   }
 
-  async function fetchAiContent(roleName, messages) {
+  async function fetchAiContent(messages, maxTokens = 500, temperature = 0.9) {
     const res = await fetch(`${settings.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${settings.apiKey}` },
-      body: JSON.stringify({ model: settings.model, messages, temperature: 0.9, max_tokens: 500, stream: false }),
+      body: JSON.stringify({ model: settings.model, messages, temperature, max_tokens: maxTokens, stream: false }),
       signal: abortController.signal
     });
     if (!res.ok) throw new Error(`API错误 ${res.status}`);
@@ -415,28 +423,66 @@
     };
   }
 
-  async function updateMemory(roleName, content) {
+  async function updateAllMemories() {
     if (!game || !settings.apiKey || !settings.model) return;
-    const role = game.roles.find(r => r.name === roleName);
-    if (!role) return;
-    const recentMessages = game.publicHistory.slice(-5).map(entry => {
-      if (entry.speaker === 'system') return `系统：${entry.content}`;
+    const aiRoles = game.roles.filter(r => !r.isPlayer);
+    if (aiRoles.length === 0) return;
+    const recentDialog = game.publicHistory.filter(e => e.speaker !== 'system').slice(-MEMORY_INTERVAL);
+    const recentTranscript = recentDialog.map(entry => {
       const speakerName = game.roles.find(r => r.name === entry.speaker)?.name || entry.speaker;
       return `${speakerName}：${entry.content}`;
     }).join('\n');
-    const systemPrompt = `你是剧本杀角色「${role.name}」。请更新你的长期记忆摘要，只输出摘要本身。\n旧摘要：${role.longTermMemory || '无'}\n\n最近对话：\n${recentMessages}\n\n新摘要要求：包含公开行动、你撒过的谎、对你不利的证据、你怀疑谁、谁怀疑你。`;
-    try {
-      const res = await fetch(`${settings.baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${settings.apiKey}` },
-        body: JSON.stringify({ model: settings.model, messages: [{ role: 'system', content: systemPrompt }], temperature: 0.3, max_tokens: 150, stream: false })
-      });
-      if (!res.ok) return;
-      const data = await res.json();
-      if (data.usage) totalTokens += data.usage.total_tokens || 0;
-      const memoryContent = (data.choices?.[0]?.message?.content || '').trim();
-      if (memoryContent) role.longTermMemory = memoryContent;
-    } catch (e) {}
+
+    let currentEvidence = '暂无';
+    if (game.round > 0 && game.script.evidence[game.round-1]) {
+      currentEvidence = game.script.evidence[game.round-1].join('；');
+    }
+
+    termPrint('[系统] 正在更新所有角色的长期记忆...', 'sys');
+    let roundTokens = 0;
+    let roundCacheHit = 0;
+    let roundCacheMiss = 0;
+
+    for (const role of aiRoles) {
+      const systemPrompt = `你是剧本杀角色「${role.name}」。\n` +
+        `你的公开身份：${role.identity}\n` +
+        `你的个人目标：${role.goal}\n` +
+        `你的隐藏秘密：${role.secret}\n` +
+        `你之前的长期记忆：${role.longTermMemory || '无'}\n\n` +
+        `当前公开证据：${currentEvidence}\n\n` +
+        `以下是最近十句公开对话：\n${recentTranscript}\n\n` +
+        `请根据以上信息，更新你的长期记忆摘要。\n` +
+        `要求：\n- 只输出摘要本身，不要解释。\n- 必须保留你过去的记忆，并融入新信息。\n- 必须包含：谁在怀疑你、你在怀疑谁、你撒过的谎、对你不利的证据、你接下来要解释的事。\n- 不要复述原话。\n- 内容要像你自己在心里做的笔记。`;
+
+      try {
+        const result = await fetchAiContent([{ role: 'system', content: systemPrompt }], 800, 0.3);
+        const memContent = result.content;
+        const usage = result.usage || {};
+        roundTokens += usage.total_tokens || 0;
+        roundCacheHit += usage.prompt_cache_hit_tokens || 0;
+        roundCacheMiss += usage.prompt_cache_miss_tokens || 0;
+        if (memContent) role.longTermMemory = memContent;
+      } catch (e) {
+        termError(`记忆更新失败：${role.name}`);
+      }
+    }
+
+    totalTokens += roundTokens;
+    totalCacheHitTokens += roundCacheHit;
+    totalCacheMissTokens += roundCacheMiss;
+    memoryTokenCost += roundTokens;
+    memoryCacheHitTokens += roundCacheHit;
+    memoryCacheMissTokens += roundCacheMiss;
+
+    const avgHit = getAverageCacheRate(roundCacheHit, roundCacheMiss);
+    const totalCost = totalTokens * COST_PER_TOKEN;
+    const memoryCost = memoryTokenCost * COST_PER_TOKEN;
+
+    termPrint('[系统] 长期记忆更新完成。', 'info');
+    termPrint(`记忆消耗 token：${roundTokens}`, 'sys');
+    termPrint(`记忆平均缓存命中率：${avgHit}`, 'sys');
+    termPrint(`记忆消耗预计：¥${memoryCost.toFixed(6)}`, 'sys');
+    termPrint(`本局总 token：${totalTokens}，总花费约¥${totalCost.toFixed(6)}`, 'sys');
   }
 
   async function generateAiSpeech(roleName) {
@@ -450,7 +496,7 @@
     let content = '';
     let usage = {};
     try {
-      const result = await fetchAiContent(roleName, messages);
+      const result = await fetchAiContent(messages);
       content = result.content;
       usage = result.usage;
       totalTokens += usage.total_tokens || 0;
@@ -488,14 +534,7 @@
     } finally {
       game.currentSpeaker = null;
       abortController = null;
-      if (content && content !== '（沉默）' && content !== '……') {
-        role.memoryCounter = (role.memoryCounter || 0) + 1;
-        if (role.memoryCounter >= 3) {
-          role.memoryCounter = 0;
-          updateMemory(roleName, content);
-        }
-      }
-      if (!pendingAsk && autoQueue.length > 0) processAutoQueue();
+      if (autoQueue.length > 0 && !pendingAsk) processAutoQueue();
     }
   }
 
@@ -506,6 +545,12 @@
     if (totalPrompt === 0) return '无数据';
     const rate = ((hit / totalPrompt) * 100).toFixed(1);
     return `${rate}%`;
+  }
+
+  function getAverageCacheRate(hit, miss) {
+    const totalPrompt = hit + miss;
+    if (totalPrompt === 0) return '无数据';
+    return ((hit / totalPrompt) * 100).toFixed(1) + '%';
   }
 
   function buildAiMessages(roleName) {
@@ -544,6 +589,15 @@
 
   function recordSpeech(roleName, content) {
     game.publicHistory.push({ speaker: roleName, content });
+    if (roleName !== 'system') {
+      dialogCounter++;
+      if (dialogCounter >= MEMORY_INTERVAL) {
+        dialogCounter = 0;
+        setTimeout(() => {
+          updateAllMemories();
+        }, 300);
+      }
+    }
   }
 
   function enterRound(roundNum) {
